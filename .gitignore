@@ -1,0 +1,8 @@
+__pycache__/
+.vscode/
+cifar10/
+data/
+images/
+logs/
+*.egg-info/
+wandb/

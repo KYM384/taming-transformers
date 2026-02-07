@@ -8,6 +8,9 @@ from taming.modules.diffusionmodules.model import Encoder, Decoder
 from taming.modules.vqvae.quantize import VectorQuantizer2 as VectorQuantizer
 from taming.modules.vqvae.quantize import GumbelQuantize
 from taming.modules.vqvae.quantize import EMAVectorQuantizer
+from taming.modules.dct import DCT, iDCT
+
+import numpy as np
 
 class VQModel(pl.LightningModule):
     def __init__(self,
@@ -40,6 +43,8 @@ class VQModel(pl.LightningModule):
             self.register_buffer("colorize", torch.randn(3, colorize_nlabels, 1, 1))
         if monitor is not None:
             self.monitor = monitor
+
+        self.automatic_optimization = False
 
     def init_from_ckpt(self, path, ignore_keys=list()):
         sd = torch.load(path, map_location="cpu")["state_dict"]
@@ -80,26 +85,52 @@ class VQModel(pl.LightningModule):
         x = x.permute(0, 3, 1, 2).to(memory_format=torch.contiguous_format)
         return x.float()
 
-    def training_step(self, batch, batch_idx, optimizer_idx):
+    def training_step(self, batch, batch_idx):
         x = self.get_input(batch, self.image_key)
+
+        # =================================================================================================
+        # Custom
+        with torch.no_grad():
+            x = DCT(x)
+            if not hasattr(self, "freqs"):
+                _, _, H, W = x.shape
+                self.freqs = np.pi**2 * ((torch.arange(W).reshape(1,W) / W).pow(2) + (torch.arange(H).reshape(H,1) / H).pow(2))
+                self.freqs = self.freqs.reshape(1, 1, H, W)
+
+                self.blur_schedule = torch.linspace(np.log(0.5), np.log(24), 200).exp()
+                self.blur_schedule = torch.cat([torch.zeros(1), self.blur_schedule])
+
+            tidx = torch.randint(0, len(self.blur_schedule), (x.shape[0],))
+            t = 0.5 * self.blur_schedule[tidx]**2
+            freqs = (- self.freqs * t[:, None, None, None]).exp().to(x)
+
+            x = iDCT(x * freqs)
+        # =================================================================================================
+        opt_g, opt_d = self.optimizers()
+
         xrec, qloss = self(x)
 
-        if optimizer_idx == 0:
-            # autoencode
-            aeloss, log_dict_ae = self.loss(qloss, x, xrec, optimizer_idx, self.global_step,
-                                            last_layer=self.get_last_layer(), split="train")
+        # autoencode
+        opt_g.zero_grad()
+        optimizer_idx = 0
+        aeloss, log_dict_ae = self.loss(qloss, x, xrec, optimizer_idx, self.global_step,
+                                        last_layer=self.get_last_layer(), split="train")
 
-            self.log("train/aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
-            self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=True)
-            return aeloss
+        # self.log("train/aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
+        self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=True)
 
-        if optimizer_idx == 1:
-            # discriminator
-            discloss, log_dict_disc = self.loss(qloss, x, xrec, optimizer_idx, self.global_step,
-                                            last_layer=self.get_last_layer(), split="train")
-            self.log("train/discloss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
-            self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=True)
-            return discloss
+        self.manual_backward(aeloss)
+        opt_g.step()
+
+        # discriminator
+        opt_d.zero_grad()
+        optimizer_idx = 1
+        discloss, log_dict_disc = self.loss(qloss, x, xrec, optimizer_idx, self.global_step,
+                                        last_layer=self.get_last_layer(), split="train")
+        self.log("train/discloss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
+        # self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=True)
+        self.manual_backward(discloss)
+        opt_d.step()
 
     def validation_step(self, batch, batch_idx):
         x = self.get_input(batch, self.image_key)
@@ -114,8 +145,8 @@ class VQModel(pl.LightningModule):
                    prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
         self.log("val/aeloss", aeloss,
                    prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
-        self.log_dict(log_dict_ae)
-        self.log_dict(log_dict_disc)
+        # self.log_dict(log_dict_ae)
+        # self.log_dict(log_dict_disc)
         return self.log_dict
 
     def configure_optimizers(self):
@@ -128,7 +159,7 @@ class VQModel(pl.LightningModule):
                                   lr=lr, betas=(0.5, 0.9))
         opt_disc = torch.optim.Adam(self.loss.discriminator.parameters(),
                                     lr=lr, betas=(0.5, 0.9))
-        return [opt_ae, opt_disc], []
+        return [opt_ae, opt_disc]
 
     def get_last_layer(self):
         return self.decoder.conv_out.weight
